@@ -2,7 +2,7 @@
 [System.Reflection.Assembly]::LoadWithPartialName('Microsoft.SqlServer.SMO') | out-null
 $ErrorActionPreference = 'Inquire'
 
-function Optimize-SQLMemory{
+function Set-SQLMemory{
 param([string]$InstanceName)
 
 $srv = New-Object -TypeName Microsoft.SqlServer.Management.Smo.Server $InstanceName
@@ -45,13 +45,7 @@ param([string]$InstanceName,
     if (($DefaultLog)){$srv.DefaultLog = $DefaultLog;$srv.Alter()}
     if (($DefaultBackup)){$srv.BackupDirectory = $DefaultBackup;$srv.Alter()}
 
-    
-    $svc = Get-Service $srv.ServiceName
-
-    $svc.Stop()
-
-    while($svc.status -ne 'Stopped'){$svc.Refresh();Write-Verbose "Waiting for $svc.name to stop"; Start-Sleep -s 1}
-    $svc.Start()
+    Write-Verbose 'Service should be restarted for all changes to take effect.'
     
 }
 
@@ -159,27 +153,137 @@ function Set-TempDB{
             
 
 function Set-SQLStartupParameters{
-    param([string]$InstanceName,
-        [string[]]$StartupParams)
+    [cmdletbinding(SupportsShouldProcess=$true)]
+    param([string[]] $Instance
+        ,[string[]] $StartupParameters
+    )
+    [bool]$SystemPaths = $false
+    
+    #Loop through and change instances
+    foreach($i in $Instance){
+        #Parse host and instance names
+        $HostName = ($i.Split('\'))[0]
+        $InstanceName = ($i.Split('\'))[1]
 
+        #Get service account names, set service account for change
+        $ServiceName = if($InstanceName){"MSSQL`$$InstanceName"}else{'MSSQLSERVER'}
+
+        #Use wmi to change account
+        $smowmi = New-Object Microsoft.SqlServer.Management.Smo.Wmi.ManagedComputer $HostName
+        $wmisvc = $smowmi.Services | Where-Object {$_.Name -eq $ServiceName}
+
+        Write-Verbose "Old Parameters for $i :"
+        Write-Verbose $wmisvc.StartupParameters
+
+        #Wrangle updated params with existing startup params (-d,-e,-l)
+        $oldparams = $wmisvc.StartupParameters -split ';'
+        $newparams = @()
+        foreach($param in $StartupParameters){
+            if($param.Substring(0,2) -match '-d|-e|-l'){
+                $SystemPaths = $true
+                $newparams += $param
+                $oldparams = $oldparams | Where-Object {$_.Substring(0,2) -ne $param.Substring(0,2)}
+            }
+            else{
+                $newparams += $param
+            }
+        }
+
+        $newparams += $oldparams | Where-Object {$_.Substring(0,2) -match '-d|-e|-l'}
+        $paramstring = ($newparams | Sort-Object) -join ';'
+
+        Write-Verbose "New Parameters for $i :"
+        Write-Verbose $paramstring
+
+        #If not -WhatIf, apply the change. Otherwise display an informational message.
+        if($PSCmdlet.ShouldProcess($i,$paramstring)){
+            $wmisvc.StartupParameters = $paramstring
+            $wmisvc.Alter()
+
+            Write-Warning "Startup Parameters for $i updated. You will need to restart the service for these changes to take effect."
+            If($SystemPaths){Write-Warning "You have changed the system paths for $i. Please make sure the paths are valid before restarting the service"}
+        }
+    }
+}
+
+function Set-SQLMaxdop{
+    param([string]$InstanceName)
+
+    
     $srv = New-Object -TypeName Microsoft.SqlServer.Management.Smo.Server $InstanceName
+    $cores = (Get-WmiObject Win32_Processor -ComputerName $srv.ComputerNamePhysicalNetBIOS).NumberOfLogicalProcessors
+    if($cores -gt 8) {
+        $maxdop = 8
+        }
+    else {
+        $maxdop = [Math]::Ceiling($cores/2)
+        }
+    $srv.Configuration.MaxDegreeOfParallelism.ConfigValue = $maxdop
+    $srv.Configuration.Alter()
+}
 
-    if($srv.InstanceName.Length -eq 0){
-        $srvinstance = 'MSSQLSERVER'
+function Test-SQLConfiguration{
+    param([string]$InstanceName='localhost'
+        ,[Parameter(Mandatory=$true)][PSObject] $Configs
+        )
+    $smosrv = new-object ('Microsoft.SqlServer.Management.Smo.Server') $InstanceName
+    $output = @()
+
+    foreach($config in $configs){
+        if($config.DesiredValue -ne $smosrv.Configuration.$($config.Name).RunValue){
+            $output += New-Object PSObject -Property (@{'Configuration'=$config.Name;
+                                                    'DesiredValue'=$config.DesiredValue;
+                                                    'CurrentValue'=$smosrv.Configuration.$($config.Name).RunValue})
+        }
+    }
+
+    return $output
+}
+
+function Set-SQLConfiguration{
+    param([string]$InstanceName='localhost'
+        ,[Parameter(Mandatory=$true)][PSObject] $Configs
+        )
+    $smosrv = new-object ('Microsoft.SqlServer.Management.Smo.Server') $InstanceName
+    $output = @()
+
+    foreach($config in $configs){
+        if($config.DesiredValue -ne $smosrv.Configuration.$($config.Name).RunValue){
+
+            $row = New-Object PSObject -Property (@{'Configuration'=$config.Name;
+                                                    'DesiredValue'=$config.DesiredValue;
+                                                    'CurrentValue'=$smosrv.Configuration.$($config.Name).RunValue})
+            $smosrv.Configuration.$($config.Name).ConfigValue = $Config.DesiredValue
+            $smosrv.Configuration.Alter()
+            $row | Add-Member -MemberType NoteProperty -Name 'ConfiguredValue' -Value $smosrv.Configuration.$($config.Name).RunValue
+            $output += $row
+            if($smosrv.Configuration.$($config.Name).IsDynamic -eq $false){$reboot=$true}
+        }
+    }
+
+    if($reboot){Write-Warning 'Altered configurations contain some that are not dynamic. Instance restart is required to apply.'}
+
+    return $output
+
+}
+
+function Get-SQLConfiguration{
+    param([string]$InstanceName='localhost'
+            ,[string[]] $Filter
+        )
+    $smosrv = new-object ('Microsoft.SqlServer.Management.Smo.Server') $InstanceName
+    $output = @()
+    if($Filter){
+        $configs = $smosrv.Configuration | Get-Member -MemberType Properties | Where-Object {$Filter.Contains($_.Name)}
     }
     else{
-        $srvinstance = $srv.InstanceName
+        $configs = $smosrv.Configuration | Get-Member -MemberType Properties | Where-Object {$_.Name -ne 'Properties'}
     }
 
-    $regroot = 'HKLM:\Software\Microsoft\Microsoft SQL Server'
-    $reginst = Get-ItemProperty "$regroot\Instance Names\SQL"
-    $instname = $reginst.$srvinstance
-
-    $sqlreg = "$regroot\$instname\MSSQLServer\Parameters"
-    $reg = Get-ItemProperty $sqlreg
-    foreach($param in $StartupParams){
-        $argcount = ($reg.PsObject.Properties | Where-Object {$_.Name -like 'SQLArg*' }).Count
-        $newparam = "SQLArg$argcount"
-        Set-ItemProperty -Path $sqlreg -Name $newparam -Value $param 
+    foreach($config in $configs){
+        $output += New-Object PSObject -Property ([Ordered]@{'Name'=$config.Name;
+                                                    'DesiredValue'=$smosrv.Configuration.$($config.Name).RunValue})
     }
+
+    return $output
 }

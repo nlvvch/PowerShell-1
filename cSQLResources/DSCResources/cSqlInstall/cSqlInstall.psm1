@@ -79,15 +79,15 @@ function Set-TargetResource
 	)
     try{    
         if(!(Test-Path $InstallPath)){
-            Write-Verbose "Invalid Installation Path $InstallPath.  Halting configuration."
+            Write-Error "Invalid Installation Path $InstallPath.  Halting configuration."
+            #"Invalid Installation Path $InstallPath.  Halting configuration." | Out-File $log
             return
         }
     
         Write-Verbose "Installation Path validated."
     
         if(!(Test-Path $ConfigPath)){
-            Write-Verbose "Invalid Configuration Path $ConfigPath.  Halting configuration."
-            return
+            Write-Error "Invalid Configuration Path $ConfigPath.  Halting configuration."
         }
     
         Write-Verbose "Configuration Path validated."
@@ -97,8 +97,7 @@ function Set-TargetResource
 
         if($UpdateEnabled){
             if(!(Test-Path $UpdatePath)){
-                Write-Verbose "Invalid Update Path $UpdatePath.  Halting configuration."
-                return
+                Write-Error "Invalid Update Path $UpdatePath.  Halting configuration."
             }
             Write-Verbose "Update Path validated"
             $installcmd += " /UPDATEENABLED=TRUE /UPDATESOURCE=$UpdatePath"
@@ -119,10 +118,10 @@ function Set-TargetResource
         $InstallCheck = ($log |Get-Content |Select-Object -Skip 1 -First 1).Contains('Passed')
 
         if(!($InstallCheck)){
-            throw 'Installation Unsuccessful'
+            Write-Error 'Installation Unsuccessful'
         }
 
-        'Installation successful, restarting server.' >> $log
+        'Installation successful, restarting server.' | Out-File $log
         $global:DSCMachineStatus = 1
     }
     catch{
